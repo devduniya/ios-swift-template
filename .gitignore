@@ -7,3 +7,4 @@ Pods/
 .swiftpm/
 .DS_Store
 *.xcodeproj/
+.claude/
