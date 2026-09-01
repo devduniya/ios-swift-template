@@ -1,0 +1,174 @@
+name: Build and Email
+
+# Builds this iOS app and emails a download link. Only runs on pushes to
+# the `deployment` branch — see README.md for the full flow.
+
+on:
+  push:
+    branches: [ deployment ]
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: Build (iOS / Swift)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen and generate the Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Detect scheme
+        id: scheme
+        run: |
+          SCHEME=$(xcodebuild -list -json | python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('project') or d.get('workspace'))['schemes'][0])")
+          echo "name=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Detected scheme: $SCHEME"
+
+      # Real-device signing is optional: only attempted if all three Apple secrets are present.
+      # Without them, this falls back to a Simulator build, which needs no signing at all.
+      - name: Import Apple signing (optional)
+        id: signing
+        env:
+          P12_BASE64: ${{ secrets.APPLE_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_P12_PASSWORD }}
+          PROVISION_BASE64: ${{ secrets.APPLE_PROVISION_BASE64 }}
+        run: |
+          if [ -z "$P12_BASE64" ] || [ -z "$PROVISION_BASE64" ]; then
+            echo "have_signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          echo "$P12_BASE64" | base64 -d > cert.p12
+          security import cert.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security list-keychain -d user -s build.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$PROVISION_BASE64" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+          echo "have_signing=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build for Simulator (no signing needed)
+        if: steps.signing.outputs.have_signing != 'true'
+        run: |
+          xcodebuild -scheme "${{ steps.scheme.outputs.name }}" -sdk iphonesimulator \
+            -configuration Debug -derivedDataPath build build CODE_SIGNING_ALLOWED=NO
+          cd build/Build/Products/Debug-iphonesimulator
+          APP=$(find . -maxdepth 1 -iname "*.app" | head -n1)
+          zip -r "${GITHUB_WORKSPACE}/build-output.zip" "$APP"
+
+      - name: Archive and export signed IPA
+        if: steps.signing.outputs.have_signing == 'true'
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcodebuild -scheme "${{ steps.scheme.outputs.name }}" -configuration Release \
+            -archivePath build/app.xcarchive archive
+          cat > build/ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>ad-hoc</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/app.xcarchive \
+            -exportPath build/ipa -exportOptionsPlist build/ExportOptions.plist
+          cd build/ipa
+          zip -r "${GITHUB_WORKSPACE}/build-output.zip" .
+
+      - name: Upload build output
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: build-output.zip
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release-and-notify:
+    name: Publish release and email
+    needs: build-ios
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build output
+        if: needs.build-ios.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: build-output
+
+      - name: Create GitHub Release
+        if: needs.build-ios.result == 'success'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Build #${{ github.run_number }}"
+          files: build-output/**
+          body: |
+            Automated build from commit ${{ github.sha }} on `${{ github.ref_name }}`.
+
+      - name: Verify email configuration
+        if: needs.build-ios.result == 'success'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          MAIL_TO: ${{ secrets.MAIL_TO || vars.MAIL_TO }}
+        run: |
+          missing=()
+          [ -z "$RESEND_API_KEY" ] && missing+=("RESEND_API_KEY (Secret)")
+          [ -z "$MAIL_TO" ] && missing+=("MAIL_TO (Secret or Variable)")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Build succeeded but can't email it: not set in this repo: ${missing[*]}. Add under Settings > Secrets and variables > Actions. MAIL_TO can be either a Secret or a Variable (Secret is checked first, Variable is used only if no Secret is set) — Variable is fine since it's just a recipient address; RESEND_API_KEY must be a Secret since it's a real credential."
+            exit 1
+          fi
+
+      - name: Email the build
+        if: needs.build-ios.result == 'success'
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          MAIL_TO: ${{ secrets.MAIL_TO || vars.MAIL_TO }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+
+          LINKS_HTML=""
+          while IFS= read -r f; do
+            NAME=$(basename "$f")
+            URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${NAME}"
+            LINKS_HTML="${LINKS_HTML}<li><a href=\"${URL}\">${NAME}</a></li>"
+          done < <(find build-output -type f | sort)
+
+          curl -fsS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg to "$MAIL_TO" \
+              --arg url "$RELEASE_URL" \
+              --arg repo "${{ github.repository }}" \
+              --arg sha "${{ github.sha }}" \
+              --arg branch "${{ github.ref_name }}" \
+              --arg links "$LINKS_HTML" \
+              '{
+                from: "Build Bot <onboarding@resend.dev>",
+                to: [$to],
+                subject: ("Build succeeded: " + $repo),
+                html: ("<p>A new build finished successfully.</p><ul><li>Repo: " + $repo + "</li><li>Branch: " + $branch + "</li><li>Commit: " + $sha + "</li></ul><p><b>Downloads:</b></p><ul>" + $links + "</ul><p><a href=\"" + $url + "\">View the full release</a></p>")
+              }')"
