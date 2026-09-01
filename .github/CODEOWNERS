@@ -1,0 +1,4 @@
+# Automation lives only on the `deployment` branch. Any PR that tries to
+# introduce workflow files anywhere else needs explicit sign-off here.
+# See docs/BRANCH-PROTECTION.md for how this is enforced.
+/.github/workflows/ @devduniya
